@@ -1,0 +1,1419 @@
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║               TARJIMONATION BOT — BARCHA FAYLLAR                           ║
+║               Saqlangan sana: 2026-07-18                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Fayllar ro'yxati:
+  1. artifacts/api-server/src/bot.ts          ← Asosiy bot logikasi (1161 qator)
+  2. artifacts/api-server/src/index.ts        ← Server va bot ishga tushurish
+  3. artifacts/api-server/src/app.ts          ← Express ilovasi
+  4. artifacts/api-server/src/lib/logger.ts   ← Logger (pino)
+  5. artifacts/api-server/src/routes/index.ts ← Route sozlamalari
+  6. artifacts/api-server/src/routes/health.ts← Health check
+  7. lib/db/src/schema/bot.ts                 ← Drizzle ORM jadvallari
+  8. lib/db/src/schema/index.ts               ← Schema eksporti
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 1: artifacts/api-server/src/bot.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * Tarjimonation Bot — full rewrite
+ * • MarkdownV2 throughout (no parse errors from special chars)
+ * • /commands registered with Telegram
+ * • Rate limiting, input validation, AI retry
+ * • Translation history, streak, /mystats, /history, /word quiz, /settings
+ */
+
+import { Telegraf, Markup } from "telegraf";
+import { message } from "telegraf/filters";
+import OpenAI from "openai";
+import { logger } from "./lib/logger";
+import { db } from "@workspace/db";
+import {
+  botUsers, botAdmins, botChannels, botSavedWords, botTranslationHistory,
+} from "@workspace/db/schema";
+import { eq, desc, sql, and, count } from "drizzle-orm";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const MAX_INPUT = 1000;
+const HISTORY_LIMIT = 20;
+const LIBRARY_PAGE = 8;
+const RATE_MS = 2000;
+
+const LANGUAGES: Record<string, { flag: string; local: string; en: string }> = {
+  uz: { flag: "🇺🇿", local: "O'zbek",            en: "Uzbek" },
+  ru: { flag: "🇷🇺", local: "Rus",               en: "Russian" },
+  en: { flag: "🇺🇸", local: "Ingliz",            en: "English" },
+  tr: { flag: "🇹🇷", local: "Turk",              en: "Turkish" },
+  ar: { flag: "🇸🇦", local: "Arab",              en: "Arabic" },
+  de: { flag: "🇩🇪", local: "Nemis",             en: "German" },
+  fr: { flag: "🇫🇷", local: "Fransuz",           en: "French" },
+  zh: { flag: "🇨🇳", local: "Xitoy",             en: "Chinese (Simplified)" },
+  ko: { flag: "🇰🇷", local: "Koreys",            en: "Korean" },
+  ja: { flag: "🇯🇵", local: "Yapon",             en: "Japanese" },
+  es: { flag: "🇪🇸", local: "Ispan",             en: "Spanish" },
+  it: { flag: "🇮🇹", local: "Italyan",           en: "Italian" },
+  pt: { flag: "🇵🇹", local: "Portugal",          en: "Portuguese" },
+  uk: { flag: "🇺🇦", local: "Ukraincha",         en: "Ukrainian" },
+  kk: { flag: "🇰🇿", local: "Qozog'istoncha",   en: "Kazakh" },
+};
+
+const LANG_CODES = Object.keys(LANGUAGES);
+
+const LEVEL_LABELS: Record<string, string> = {
+  A1: "🟢 A1 — Boshlang'ich",
+  A2: "🟢 A2 — Oddiy",
+  B1: "🔵 B1 — O'rta",
+  B2: "🔵 B2 — O'rta\\-yuqori",
+  C1: "🟣 C1 — Yuqori",
+  C2: "🟣 C2 — Professional",
+};
+
+// ─── MarkdownV2 helpers ───────────────────────────────────────────────────────
+
+/** Escape all MarkdownV2 special characters */
+function e(text: string): string {
+  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+}
+
+/** Bold */
+function b(text: string): string { return `*${e(text)}*`; }
+
+/** Italic */
+function i(text: string): string { return `_${e(text)}_`; }
+
+/** Inline code */
+function c(text: string): string { return `\`${e(text)}\``; }
+
+/** Raw bold — text already escaped */
+function rb(text: string): string { return `*${text}*`; }
+
+// ─── AI ───────────────────────────────────────────────────────────────────────
+
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!_openai) {
+    const apiKey = process.env["OPENAI_API_KEY"] ?? "";
+    const baseURL = apiKey.startsWith("gsk_") ? "https://api.groq.com/openai/v1" : undefined;
+    _openai = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  }
+  return _openai;
+}
+function getModel(): string {
+  return (process.env["OPENAI_API_KEY"] ?? "").startsWith("gsk_")
+    ? "llama-3.3-70b-versatile" : "gpt-4o-mini";
+}
+
+interface TResult {
+  translated: string;
+  level: string;
+  definition: string;
+  synonyms: string[];
+  detectedLang: string; // ISO code auto-detected by AI
+}
+
+// Map common AI-returned language names → our lang codes
+const LANG_NAME_TO_CODE: Record<string, string> = {
+  uzbek: "uz", russian: "ru", english: "en", turkish: "tr",
+  arabic: "ar", german: "de", french: "fr", chinese: "zh",
+  korean: "ko", japanese: "ja", spanish: "es", italian: "it",
+  portuguese: "pt", ukrainian: "uk", kazakh: "kk",
+  "o'zbek": "uz", "o'zbekcha": "uz", rus: "ru", ingliz: "en",
+};
+
+function normalizeLangCode(raw: string): string {
+  const key = raw.toLowerCase().trim();
+  // Direct code match
+  if (LANGUAGES[key]) return key;
+  // Name match
+  return LANG_NAME_TO_CODE[key] ?? "en";
+}
+
+async function translateFull(text: string, tgtCode: string, attempt = 0): Promise<TResult> {
+  const tgtEn = LANGUAGES[tgtCode]?.en ?? tgtCode;
+  const isShort = text.trim().split(/\s+/).length <= 4;
+
+  const systemPrompt = isShort
+    ? `You are an expert multilingual dictionary assistant. Your job is to accurately translate words and short phrases, detect their source language, assign a CEFR level, and provide a simple child-friendly definition and synonyms.
+
+RULES:
+- Detect the source language precisely (e.g. Uzbek, Russian, English, Turkish, Arabic, etc.)
+- Translate ACCURATELY into ${tgtEn} — do NOT guess or invent meaning
+- For Uzbek (uz): it uses Latin script (a,b,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,x,y,z,oʻ,gʻ,sh,ch,ng) or Cyrillic — handle both
+- definition must be written in the SAME language as the input text (the source language)
+- synonyms must all be in ${tgtEn}
+- CEFR level is for the TRANSLATED word/phrase in ${tgtEn}
+- Output ONLY valid JSON — no markdown, no explanation, no extra text`
+    : `You are an expert professional translator. Accurately translate texts between languages.
+
+RULES:
+- Detect the source language precisely
+- Translate the FULL text accurately into ${tgtEn} — preserve meaning, tone, and nuance
+- definition: a brief 1-sentence summary of the text written in the source language
+- synonyms: 3 alternative phrasings/expressions in ${tgtEn}
+- CEFR level: complexity estimate of the source text
+- Output ONLY valid JSON — no markdown, no explanation, no extra text`;
+
+  const userPrompt = isShort
+    ? `Translate this word/phrase into ${tgtEn}:
+"${text}"
+
+Respond with this exact JSON structure:
+{"detectedLang":"<ISO 639-1 code, e.g. uz/ru/en/tr/ar/de/fr/zh/ko/ja/es/it/pt/uk/kk>","translated":"<accurate translation in ${tgtEn}>","level":"<CEFR A1/A2/B1/B2/C1/C2>","definition":"<simple 1-sentence explanation in the source language>","synonyms":["<synonym1 in ${tgtEn}>","<synonym2 in ${tgtEn}>","<synonym3 in ${tgtEn}>"]}`
+    : `Translate the following text into ${tgtEn}:
+"${text}"
+
+Respond with this exact JSON structure:
+{"detectedLang":"<ISO 639-1 code>","translated":"<full accurate translation in ${tgtEn}>","level":"<CEFR A1/A2/B1/B2/C1/C2>","definition":"<1-sentence summary in source language>","synonyms":["<alt phrasing 1 in ${tgtEn}>","<alt phrasing 2 in ${tgtEn}>","<alt phrasing 3 in ${tgtEn}>"]}`  ;
+
+  const res = await getOpenAI().chat.completions.create({
+    model: getModel(),
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    max_tokens: 700,
+    temperature: 0,
+  });
+
+  const raw = (res.choices[0]?.message?.content ?? "").trim();
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) {
+    if (attempt < 2) return translateFull(text, tgtCode, attempt + 1);
+    throw new Error("AI returned unparseable response after retries");
+  }
+  const parsed = JSON.parse(match[0]) as TResult;
+  parsed.synonyms = (parsed.synonyms ?? []).filter(Boolean).slice(0, 5);
+  parsed.level = (parsed.level ?? "").toUpperCase().replace(/^(A1|A2|B1|B2|C1|C2).*/, "$1");
+  if (!["A1","A2","B1","B2","C1","C2"].includes(parsed.level)) parsed.level = "B1";
+  parsed.detectedLang = normalizeLangCode(parsed.detectedLang ?? "");
+  return parsed;
+}
+
+function formatResult(r: TResult, tgtCode: string, original: string): string {
+  const src = LANGUAGES[r.detectedLang] ?? { flag: "🌐", local: r.detectedLang };
+  const tgt = LANGUAGES[tgtCode] ?? { flag: "🌐", local: tgtCode };
+  const levelLine = LEVEL_LABELS[r.level] ?? `📊 ${e(r.level)}`;
+  const syns = r.synonyms.length
+    ? r.synonyms.map(s => c(s)).join("  •  ")
+    : e("—");
+
+  return [
+    `${e(src.flag)} ${e(src.local)} ➜ ${e(tgt.flag)} ${e(tgt.local)}`,
+    "",
+    `📝 ${b(original)}`,
+    `➡️ ${b(r.translated)}`,
+    "",
+    levelLine,
+    "",
+    `💡 ${rb("Ta'rif:")} ${e(r.definition)}`,
+    "",
+    `🔄 ${rb("Sinonimlar:")} ${syns}`,
+  ].join("\n");
+}
+
+// ─── Rate limiter ─────────────────────────────────────────────────────────────
+
+const lastReq = new Map<number, number>();
+function isRateLimited(uid: number): boolean {
+  const now = Date.now();
+  const last = lastReq.get(uid) ?? 0;
+  if (now - last < RATE_MS) return true;
+  lastReq.set(uid, now);
+  return false;
+}
+
+// ─── Pending save (in-memory, keyed by userId) ────────────────────────────────
+
+const pendingSave = new Map<number, {
+  original: string; translated: string;
+  sourceLang: string; targetLang: string;
+  level: string; definition: string; synonyms: string[];
+}>();
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+
+async function upsertUser(from: {
+  id: number; username?: string; first_name?: string; last_name?: string;
+}) {
+  const today = new Date().toISOString().slice(0, 10);
+  const existing = await db.select().from(botUsers).where(eq(botUsers.telegramId, from.id)).limit(1);
+
+  if (existing.length === 0) {
+    await db.insert(botUsers).values({
+      telegramId: from.id,
+      username: from.username ?? null,
+      firstName: from.first_name ?? null,
+      lastName: from.last_name ?? null,
+      sourceLang: "uz",
+      targetLang: "en",
+      lastStreakDate: today,
+      streakDays: 1,
+    });
+    return;
+  }
+
+  const u = existing[0]!;
+  const lastDate = u.lastStreakDate;
+  const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+  let streakDays = u.streakDays;
+  let lastStreakDate = u.lastStreakDate;
+
+  if (lastDate !== today) {
+    if (lastDate === yesterday) { streakDays += 1; }
+    else { streakDays = 1; }
+    lastStreakDate = today;
+  }
+
+  await db.update(botUsers)
+    .set({
+      lastActiveAt: new Date(),
+      username: from.username ?? null,
+      firstName: from.first_name ?? null,
+      lastStreakDate,
+      streakDays,
+    })
+    .where(eq(botUsers.telegramId, from.id));
+}
+
+async function getUserTargetLang(uid: number): Promise<string> {
+  const rows = await db.select({ targetLang: botUsers.targetLang })
+    .from(botUsers).where(eq(botUsers.telegramId, uid)).limit(1);
+  return rows[0]?.targetLang ?? "en";
+}
+
+/** @deprecated use getUserTargetLang */
+async function getUserLangs(uid: number) {
+  const tgt = await getUserTargetLang(uid);
+  return { sourceLang: "auto", targetLang: tgt };
+}
+
+async function getUser(uid: number) {
+  const rows = await db.select().from(botUsers).where(eq(botUsers.telegramId, uid)).limit(1);
+  return rows[0] ?? null;
+}
+
+async function isAdmin(uid: number): Promise<boolean> {
+  const env = (process.env["BOT_ADMIN_IDS"] ?? "").split(",").map(s => s.trim()).filter(Boolean);
+  if (env.includes(String(uid))) return true;
+  const rows = await db.select().from(botAdmins).where(eq(botAdmins.telegramId, uid)).limit(1);
+  return rows.length > 0;
+}
+
+async function isBlocked(uid: number): Promise<boolean> {
+  const rows = await db.select({ isBlocked: botUsers.isBlocked }).from(botUsers)
+    .where(eq(botUsers.telegramId, uid)).limit(1);
+  return rows[0]?.isBlocked ?? false;
+}
+
+async function getChannels() {
+  return db.select().from(botChannels).orderBy(botChannels.addedAt);
+}
+
+async function checkSubs(bot: Telegraf, uid: number) {
+  const channels = await getChannels();
+  if (!channels.length) return { ok: true, missing: [] as { name: string; link: string }[] };
+  const missing: { name: string; link: string }[] = [];
+  for (const ch of channels) {
+    try {
+      const m = await bot.telegram.getChatMember(ch.channelId, uid);
+      if (!["member", "administrator", "creator"].includes(m.status))
+        missing.push({ name: ch.channelName, link: ch.channelLink });
+    } catch {
+      missing.push({ name: ch.channelName, link: ch.channelLink });
+    }
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+async function addHistory(uid: number, r: TResult, original: string, srcLang: string, tgtLang: string) {
+  // Insert
+  await db.insert(botTranslationHistory).values({
+    telegramId: uid, original, translated: r.translated,
+    sourceLang: srcLang, targetLang: tgtLang, level: r.level,
+  });
+  // Trim to HISTORY_LIMIT
+  const ids = await db.select({ id: botTranslationHistory.id })
+    .from(botTranslationHistory)
+    .where(eq(botTranslationHistory.telegramId, uid))
+    .orderBy(desc(botTranslationHistory.translatedAt));
+  if (ids.length > HISTORY_LIMIT) {
+    const oldIds = ids.slice(HISTORY_LIMIT).map(r => r.id);
+    for (const id of oldIds) {
+      await db.delete(botTranslationHistory).where(eq(botTranslationHistory.id, id));
+    }
+  }
+  // Increment counter
+  await db.update(botUsers)
+    .set({ totalTranslations: sql`${botUsers.totalTranslations} + 1` })
+    .where(eq(botUsers.telegramId, uid));
+}
+
+// ─── Keyboards ────────────────────────────────────────────────────────────────
+
+function mainKb() {
+  return Markup.keyboard([
+    ["🌍 Tarjima tili", "📚 Kutubxona"],
+    ["🕐 Tarix", "❓ Yordam"],
+    ["📞 Adminga murojat"],
+  ]).resize();
+}
+
+function adminKb() {
+  return Markup.keyboard([
+    ["📊 Statistika", "📡 Kanallar"],
+    ["📢 Broadcast", "👥 Foydalanuvchilar"],
+    ["🔙 Orqaga"],
+  ]).resize();
+}
+
+function cancelKb() {
+  return Markup.keyboard([["❌ Bekor qilish"]]).resize();
+}
+
+/** Target language inline keyboard — 3 columns, popular langs first */
+const POPULAR_LANGS = ["en", "ru", "uz", "tr", "ar", "de", "fr", "zh", "ko", "ja", "es", "it", "pt", "uk", "kk"];
+
+function tgtLangIK(selected?: string) {
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  for (let i = 0; i < POPULAR_LANGS.length; i += 3) {
+    const trio = POPULAR_LANGS.slice(i, i + 3);
+    rows.push(trio.map(code => {
+      const lang = LANGUAGES[code]!;
+      const tick = selected === code ? "✅ " : "";
+      return Markup.button.callback(`${tick}${lang.flag} ${lang.local}`, `tgt_${code}`);
+    }));
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
+function subKb(missing: { name: string; link: string }[]) {
+  const btns = missing.map(ch => [Markup.button.url(`📢 ${ch.name}`, ch.link)]);
+  btns.push([Markup.button.callback("✅ Obunani tekshirish", "check_sub")]);
+  return Markup.inlineKeyboard(btns);
+}
+
+function saveKb(saved = false) {
+  return Markup.inlineKeyboard([[
+    saved
+      ? Markup.button.callback("✅ Saqlangan", "already_saved")
+      : Markup.button.callback("💾 Kutubxonaga saqlash", "save_word"),
+  ]]);
+}
+
+function libPageKb(page: number, total: number) {
+  const totalPages = Math.ceil(total / LIBRARY_PAGE);
+  const btns: ReturnType<typeof Markup.button.callback>[] = [];
+  if (page > 0) btns.push(Markup.button.callback("◀️", `lib_${page - 1}`));
+  btns.push(Markup.button.callback(`${page + 1}/${totalPages}`, "lib_noop"));
+  if ((page + 1) * LIBRARY_PAGE < total) btns.push(Markup.button.callback("▶️", `lib_${page + 1}`));
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [btns];
+  rows.push([Markup.button.callback("🗑 Barchasini o'chirish", "clear_library")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+// ─── Admin state machine ──────────────────────────────────────────────────────
+
+type AState =
+  | { type: "idle" }
+  | { type: "broadcast" }
+  | { type: "ch_id" }
+  | { type: "ch_name"; channelId: string }
+  | { type: "ch_link"; channelId: string; channelName: string };
+
+const aStates = new Map<number, AState>();
+const getAS = (uid: number): AState => aStates.get(uid) ?? { type: "idle" };
+const setAS = (uid: number, s: AState) => aStates.set(uid, s);
+
+// ─── Library display ──────────────────────────────────────────────────────────
+
+async function buildLibraryPage(uid: number, page: number) {
+  const all = await db.select().from(botSavedWords)
+    .where(eq(botSavedWords.telegramId, uid))
+    .orderBy(desc(botSavedWords.savedAt));
+
+  if (all.length === 0) return null;
+
+  const pageItems = all.slice(page * LIBRARY_PAGE, (page + 1) * LIBRARY_PAGE);
+  const lines = pageItems.map((w, i) => {
+    const n = page * LIBRARY_PAGE + i + 1;
+    const src = LANGUAGES[w.sourceLang];
+    const tgt = LANGUAGES[w.targetLang];
+    const lv = w.level ? ` \\(${e(w.level)}\\)` : "";
+    const flags = src && tgt ? ` ${e(src.flag)}➜${e(tgt.flag)}` : "";
+    return `${e(String(n))}\\. ${b(w.original)} ➜ ${b(w.translated)}${lv}${flags}`;
+  });
+
+  return {
+    text: `📚 *Kutubxona* \\(${e(String(all.length))} ta so'z\\)\n\n${lines.join("\n")}`,
+    kb: libPageKb(page, all.length),
+  };
+}
+
+// ─── Main bot factory ─────────────────────────────────────────────────────────
+
+export function createBot(): Telegraf {
+  const token = process.env["TELEGRAM_BOT_TOKEN"];
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set");
+
+  const bot = new Telegraf(token);
+
+  // ── Register Telegram command list ──────────────────────────────────────────
+
+  void bot.telegram.setMyCommands([
+    { command: "start",    description: "Botni boshlash" },
+    { command: "help",     description: "Yordam va qo'llanma" },
+    { command: "settings", description: "Tillarni sozlash" },
+    { command: "library",  description: "Saqlangan so'zlar" },
+    { command: "history",  description: "So'nggi tarjimalar" },
+    { command: "mystats",  description: "Mening statistikam" },
+    { command: "word",     description: "Kutubxonadan tasodifiy so'z (quiz)" },
+    { command: "contact",  description: "Adminga murojat" },
+    { command: "cancel",   description: "Amalni bekor qilish" },
+  ]);
+
+  // ── Guard middleware ─────────────────────────────────────────────────────────
+
+  bot.use(async (ctx, next) => {
+    const uid = ctx.from?.id;
+    if (!uid) return next();
+
+    // Always upsert user (updates streak, last active)
+    if (ctx.from) {
+      await upsertUser(ctx.from).catch(err => logger.warn({ err }, "upsertUser failed"));
+    }
+
+    if (await isBlocked(uid).catch(() => false)) {
+      return ctx.reply("❌ Siz botdan bloklandingiz\\. Admin bilan bog'laning\\.", { parse_mode: "MarkdownV2" });
+    }
+
+    // Allow /start through without sub check
+    const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
+    if (text === "/start") return next();
+
+    // Admins skip subscription check
+    if (await isAdmin(uid).catch(() => false)) return next();
+
+    const { ok, missing } = await checkSubs(bot, uid).catch(() => ({ ok: true, missing: [] }));
+    if (!ok) {
+      return ctx.reply(
+        "📢 *Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:*",
+        { parse_mode: "MarkdownV2", ...subKb(missing) }
+      );
+    }
+
+    return next();
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // COMMANDS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── /start ──────────────────────────────────────────────────────────────────
+
+  bot.command("start", async (ctx) => {
+    const admin = await isAdmin(ctx.from!.id).catch(() => false);
+    const tgtCode = await getUserTargetLang(ctx.from!.id).catch(() => "en");
+    const tgt = LANGUAGES[tgtCode]!;
+    const name = e(ctx.from!.first_name ?? "Do'st");
+
+    await ctx.reply(
+      `🌐 *Tarjimonation* ga xush kelibsiz, ${name}\\!\n\n` +
+      `🔍 Manba til: *avtomatik aniqlanadi*\n` +
+      `🎯 Tarjima tili: ${e(tgt.flag)} *${e(tgt.local)}*\n\n` +
+      `Istalgan tilda so'z yoki gap yuboring — bot o'zi tilni aniqlab, tarjima qiladi\\!`,
+      { parse_mode: "MarkdownV2", ...(admin ? adminKb() : mainKb()) }
+    );
+  });
+
+  // ── /help ───────────────────────────────────────────────────────────────────
+
+  const HELP_TEXT =
+    `📖 *Tarjimonation — To'liq Qo'llanma*\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `🔤 *TARJIMA QILISH*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `Istalgan tilda so'z yoki gap yuboring — bot tilni o'zi aniqlab tarjima qiladi\\.\n\n` +
+    `Har bir tarjimada quyidagilar chiqadi:\n` +
+    `• ➡️ Tarjima matni\n` +
+    `• 📊 *CEFR daraja* — so'zning qiyinlik darajasi:\n` +
+    `   🟢 A1/A2 — Juda oddiy \\(boshlang'ichlar uchun\\)\n` +
+    `   🔵 B1/B2 — O'rtacha \\(kundalik muloqot\\)\n` +
+    `   🟣 C1/C2 — Murakkab \\(professional daraja\\)\n` +
+    `• 💡 *Sodda ta'rif* — so'zning tushuntirilishi\n` +
+    `• 🔄 *Sinonimlar* — o'xshash ma'nodagi so'zlar\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `🌍 *TARJIMA TILI*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `Bot *manba tilni avtomatik* aniqLaydi — siz hech narsa tanlamasdan istalgan tilda yozaversiz\\.\n\n` +
+    `Faqat *tarjima tilinI* bir marta tanlaysiz:\n` +
+    `🌍 *Tarjima tili* tugmasi yoki /settings buyrug'i\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `📚 *KUTUBXONA*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `Tarjima ostidagi 💾 tugmani bosib so'z saqlang\\.\n` +
+    `/library — barcha saqlangan so'zlar\n` +
+    `/word — kutubxonadan tasodifiy so'z \\(quiz\\)\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `📜 *TARIX*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `/history — so'nggi ${HISTORY_LIMIT} ta tarjimangiz\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `📈 *STATISTIKA*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `/mystats — tarjimalar soni, streak, kutubxona hajmi\n\n` +
+
+    `━━━━━━━━━━━━━━━━━\n` +
+    `📋 *BARCHA BUYRUQLAR*\n` +
+    `━━━━━━━━━━━━━━━━━\n` +
+    `/start — Botni qayta boshlash\n` +
+    `/settings — Tarjima tilini tanlash\n` +
+    `/library — Saqlangan so'zlar\n` +
+    `/history — So'nggi tarjimalar\n` +
+    `/mystats — Statistika\n` +
+    `/word — Quiz \\(tasodifiy so'z\\)\n` +
+    `/contact — Adminga murojat\n` +
+    `/cancel — Amalni bekor qilish\n\n` +
+
+    `🤖 Bot AI texnologiyasi asosida ishlaydi\\.`;
+
+  bot.command("help", (ctx) => ctx.reply(HELP_TEXT, { parse_mode: "MarkdownV2" }));
+  bot.hears("❓ Yordam", (ctx) => ctx.reply(HELP_TEXT, { parse_mode: "MarkdownV2" }));
+
+  // ── /settings ───────────────────────────────────────────────────────────────
+
+  async function showSettings(ctx: any) {
+    const tgtCode = await getUserTargetLang(ctx.from!.id).catch(() => "en");
+    const tgt = LANGUAGES[tgtCode]!;
+    return ctx.reply(
+      `⚙️ *Sozlamalar*\n\n` +
+      `🔍 *Manba til:* avtomatik aniqlanadi\n` +
+      `🎯 *Tarjima tili:* ${e(tgt.flag)} *${e(tgt.local)}*\n\n` +
+      `Qaysi tilga tarjima qilishini tanlang:`,
+      { parse_mode: "MarkdownV2", ...tgtLangIK(tgtCode) }
+    );
+  }
+
+  bot.command("settings", (ctx) => showSettings(ctx));
+
+  // ── /library ────────────────────────────────────────────────────────────────
+
+  async function sendLibrary(ctx: any, page = 0) {
+    const page_ = await buildLibraryPage(ctx.from!.id, page);
+    if (!page_) {
+      return ctx.reply(
+        `📚 *Kutubxonangiz bo'sh*\n\n` +
+        `Tarjima ostidagi 💾 tugmani bosib so'z saqlang\\.`,
+        { parse_mode: "MarkdownV2" }
+      );
+    }
+    return ctx.reply(page_.text, { parse_mode: "MarkdownV2", ...page_.kb });
+  }
+
+  bot.command("library", (ctx) => sendLibrary(ctx, 0));
+  bot.hears("📚 Kutubxona", (ctx) => sendLibrary(ctx, 0));
+
+  bot.action(/^lib_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const page = parseInt(ctx.match[1]!, 10);
+    const page_ = await buildLibraryPage(ctx.from!.id, page).catch(() => null);
+    if (!page_) return ctx.editMessageText("📚 Kutubxona bo'sh.");
+    return ctx.editMessageText(page_.text, { parse_mode: "MarkdownV2", ...page_.kb });
+  });
+
+  bot.action("lib_noop", (ctx) => ctx.answerCbQuery());
+
+  // ── /history ─────────────────────────────────────────────────────────────────
+
+  async function sendHistory(ctx: any) {
+    const uid = ctx.from!.id;
+    const hist = await db.select().from(botTranslationHistory)
+      .where(eq(botTranslationHistory.telegramId, uid))
+      .orderBy(desc(botTranslationHistory.translatedAt))
+      .limit(HISTORY_LIMIT);
+
+    if (!hist.length) {
+      return ctx.reply("🕐 *Tarix bo'sh*\n\nHali hech narsa tarjima qilmadingiz\\.", { parse_mode: "MarkdownV2" });
+    }
+
+    const lines = hist.map((h, i) => {
+      const src = LANGUAGES[h.sourceLang];
+      const tgt = LANGUAGES[h.targetLang];
+      const flags = src && tgt ? `${e(src.flag)}➜${e(tgt.flag)} ` : "";
+      const lv = h.level ? ` \\(${e(h.level)}\\)` : "";
+      return `${e(String(i + 1))}\\. ${flags}${b(h.original)} ➜ ${e(h.translated)}${lv}`;
+    });
+
+    return ctx.reply(
+      `🕐 *So'nggi ${e(String(hist.length))} ta tarjima:*\n\n${lines.join("\n")}`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  bot.command("history", (ctx) => sendHistory(ctx));
+  bot.hears("🕐 Tarix", (ctx) => sendHistory(ctx));
+
+  // ── /mystats ────────────────────────────────────────────────────────────────
+
+  bot.command("mystats", async (ctx) => {
+    const uid = ctx.from!.id;
+    const [user, savedRows, histRows] = await Promise.all([
+      getUser(uid),
+      db.select({ cnt: count() }).from(botSavedWords).where(eq(botSavedWords.telegramId, uid)),
+      db.select({ cnt: count() }).from(botTranslationHistory).where(eq(botTranslationHistory.telegramId, uid)),
+    ]);
+    const saved = savedRows[0]?.cnt ?? 0;
+    const total = user?.totalTranslations ?? 0;
+    const streak = user?.streakDays ?? 0;
+    const joined = user?.createdAt?.toLocaleDateString("uz-UZ") ?? "—";
+
+    const streakEmoji = streak >= 30 ? "🔥" : streak >= 7 ? "⚡" : streak >= 3 ? "✨" : "📅";
+
+    return ctx.reply(
+      `📈 *Mening statistikam*\n\n` +
+      `📝 Jami tarjimalar: *${e(String(total))}* ta\n` +
+      `📚 Saqlangan so'zlar: *${e(String(saved))}* ta\n` +
+      `${streakEmoji} Ketma\\-ket kunlar: *${e(String(streak))}* kun\n` +
+      `📅 Qo'shilgan sana: *${e(joined)}*`,
+      { parse_mode: "MarkdownV2" }
+    );
+  });
+
+  // ── /word (quiz) ─────────────────────────────────────────────────────────────
+
+  const quizAnswers = new Map<number, string>(); // userId -> correct answer
+
+  bot.command("word", async (ctx) => {
+    const uid = ctx.from!.id;
+    const words = await db.select().from(botSavedWords)
+      .where(eq(botSavedWords.telegramId, uid));
+
+    if (words.length < 1) {
+      return ctx.reply(
+        `📚 Kutubxonangiz bo'sh\\.\n\nAvval so'z saqlang, so'ngra /word buyrug'ini ishlating\\.`,
+        { parse_mode: "MarkdownV2" }
+      );
+    }
+
+    const pick = words[Math.floor(Math.random() * words.length)]!;
+    quizAnswers.set(uid, pick.translated.toLowerCase());
+
+    // Build wrong choices from other saved words
+    const others = words.filter(w => w.id !== pick.id).sort(() => Math.random() - 0.5).slice(0, 3);
+    const choices = [...others.map(w => w.translated), pick.translated]
+      .sort(() => Math.random() - 0.5);
+
+    const src = LANGUAGES[pick.sourceLang];
+    const tgt = LANGUAGES[pick.targetLang];
+    const flags = src && tgt ? `${e(src.flag)}➜${e(tgt.flag)}` : "";
+
+    const btns = choices.map(ch => [Markup.button.callback(ch, `quiz_${ch}`)]);
+
+    return ctx.reply(
+      `🧠 *Quiz \\— so'zni toping\\!* ${flags}\n\n` +
+      `❓ *"${e(pick.original)}"* — bu qaysi so'z?`,
+      { parse_mode: "MarkdownV2", ...Markup.inlineKeyboard(btns) }
+    );
+  });
+
+  bot.action(/^quiz_(.+)$/, async (ctx) => {
+    const chosen = ctx.match[1]!;
+    const correct = quizAnswers.get(ctx.from!.id);
+    quizAnswers.delete(ctx.from!.id);
+    if (!correct) return ctx.answerCbQuery("Quiz muddati o'tdi. /word buyrug'ini qayta ishlatng.");
+    const ok = chosen.toLowerCase() === correct;
+    await ctx.answerCbQuery(ok ? "✅ To'g'ri!" : `❌ Noto'g'ri! To'g'ri javob: ${correct}`);
+    return ctx.editMessageText(
+      ok
+        ? `✅ *To'g'ri\\!* 🎉\n\nJavob: ${b(correct)}`
+        : `❌ *Noto'g'ri\\!*\n\nSiz: ${b(chosen)}\nTo'g'ri: ${b(correct)}`,
+      { parse_mode: "MarkdownV2", ...Markup.inlineKeyboard([[Markup.button.callback("🔁 Yana", "quiz_again")]]) }
+    );
+  });
+
+  bot.action("quiz_again", async (ctx) => {
+    await ctx.answerCbQuery();
+    const uid = ctx.from!.id;
+    const words = await db.select().from(botSavedWords).where(eq(botSavedWords.telegramId, uid));
+    if (!words.length) return ctx.editMessageText("📚 Kutubxona bo'sh.");
+    const pick = words[Math.floor(Math.random() * words.length)]!;
+    quizAnswers.set(uid, pick.translated.toLowerCase());
+    const others = words.filter(w => w.id !== pick.id).sort(() => Math.random() - 0.5).slice(0, 3);
+    const choices = [...others.map(w => w.translated), pick.translated].sort(() => Math.random() - 0.5);
+    const src = LANGUAGES[pick.sourceLang];
+    const tgt = LANGUAGES[pick.targetLang];
+    const flags = src && tgt ? `${e(src.flag)}➜${e(tgt.flag)}` : "";
+    const btns = choices.map(ch => [Markup.button.callback(ch, `quiz_${ch}`)]);
+    return ctx.editMessageText(
+      `🧠 *Quiz \\— so'zni toping\\!* ${flags}\n\n❓ *"${e(pick.original)}"* — bu qaysi so'z?`,
+      { parse_mode: "MarkdownV2", ...Markup.inlineKeyboard(btns) }
+    );
+  });
+
+  // ── /contact ────────────────────────────────────────────────────────────────
+
+  async function sendContact(ctx: any) {
+    const envAdmins = (process.env["BOT_ADMIN_IDS"] ?? "").split(",").map(s => s.trim()).filter(Boolean);
+    const dbAdmins = await db.select().from(botAdmins).limit(5).catch(() => []);
+
+    const links: string[] = [];
+    for (const id of envAdmins) {
+      const rows = await db.select({ username: botUsers.username })
+        .from(botUsers).where(eq(botUsers.telegramId, Number(id))).limit(1).catch(() => []);
+      links.push(rows[0]?.username ? `@${rows[0].username}` : `[Admin](tg://user?id=${id})`);
+    }
+    for (const a of dbAdmins) {
+      if (a.username && !links.includes(`@${a.username}`)) links.push(`@${a.username}`);
+    }
+
+    const adminText = links.slice(0, 3).join("\n") || "Admin hozirda mavjud emas";
+
+    return ctx.reply(
+      `📞 *Adminga murojat*\n\n` +
+      `Savol yoki muammo bo'lsa, quyidagi admin bilan bog'laning:\n\n` +
+      `${adminText}\n\n` +
+      `Xabaringizni to'g'ridan\\-to'g'ri yuborishingiz mumkin\\.`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  bot.command("contact", (ctx) => sendContact(ctx));
+  bot.hears("📞 Adminga murojat", (ctx) => sendContact(ctx));
+
+  // ── /cancel ─────────────────────────────────────────────────────────────────
+
+  bot.command("cancel", async (ctx) => {
+    setAS(ctx.from!.id, { type: "idle" });
+    const admin = await isAdmin(ctx.from!.id).catch(() => false);
+    return ctx.reply("❌ *Bekor qilindi\\.* Asosiy menyuga qaytdingiz\\.", {
+      parse_mode: "MarkdownV2",
+      ...(admin ? adminKb() : mainKb()),
+    });
+  });
+
+  // ─── Lang selection ──────────────────────────────────────────────────────────
+
+  // "🌍 Tarjima tili" reply-keyboard button
+  bot.hears("🌍 Tarjima tili", async (ctx) => {
+    const tgtCode = await getUserTargetLang(ctx.from!.id).catch(() => "en");
+    return ctx.reply(
+      `🌍 *Qaysi tilga tarjima qilishini tanlang:*\n\n🔍 Manba til avtomatik aniqlanadi — siz istalgan tilda yozaversiz\\.`,
+      { parse_mode: "MarkdownV2", ...tgtLangIK(tgtCode) }
+    );
+  });
+
+  // tgt_XX callback — one-tap target lang change
+  bot.action(/^tgt_(.+)$/, async (ctx) => {
+    const code = ctx.match[1]!;
+    const lang = LANGUAGES[code];
+    if (!lang) return ctx.answerCbQuery("Noto'g'ri til");
+    await db.update(botUsers).set({ targetLang: code }).where(eq(botUsers.telegramId, ctx.from!.id)).catch(() => {});
+    await ctx.answerCbQuery(`✅ ${lang.flag} ${lang.local} tanlandi`);
+    return ctx.editMessageText(
+      `✅ *Tarjima tili:* ${e(lang.flag)} *${e(lang.local)}*\n\n🔍 Manba til avtomatik aniqlanadi\\.\nIstalgan tilda so'z yuboring\\!`,
+      { parse_mode: "MarkdownV2", ...tgtLangIK(code) }
+    );
+  });
+
+  // ─── Save word ───────────────────────────────────────────────────────────────
+
+  bot.action("save_word", async (ctx) => {
+    const uid = ctx.from!.id;
+    const data = pendingSave.get(uid);
+    if (!data) return ctx.answerCbQuery("⚠️ So'z topilmadi. Qayta tarjima qiling.");
+
+    const existing = await db.select({ id: botSavedWords.id }).from(botSavedWords)
+      .where(and(
+        eq(botSavedWords.telegramId, uid),
+        eq(botSavedWords.original, data.original),
+        eq(botSavedWords.targetLang, data.targetLang),
+      )).limit(1).catch(() => []);
+
+    if (existing.length > 0) return ctx.answerCbQuery("✅ Bu so'z allaqachon kutubxonangizda!");
+
+    await db.insert(botSavedWords).values({
+      telegramId: uid, original: data.original, translated: data.translated,
+      sourceLang: data.sourceLang, targetLang: data.targetLang,
+      level: data.level, definition: data.definition, synonyms: data.synonyms,
+    }).catch(() => {});
+
+    await ctx.answerCbQuery("✅ Kutubxonaga saqlandi!");
+    await ctx.editMessageReplyMarkup(saveKb(true).reply_markup).catch(() => {});
+  });
+
+  bot.action("already_saved", (ctx) => ctx.answerCbQuery("✅ Bu so'z kutubxonangizda bor!"));
+
+  // ─── Clear library ───────────────────────────────────────────────────────────
+
+  bot.action("clear_library", async (ctx) => {
+    await db.delete(botSavedWords).where(eq(botSavedWords.telegramId, ctx.from!.id)).catch(() => {});
+    await ctx.answerCbQuery("🗑 Kutubxona tozalandi");
+    return ctx.editMessageText("📚 *Kutubxonangiz bo'shatildi\\.* Yangi so'zlar saqlashni boshlang\\!", {
+      parse_mode: "MarkdownV2",
+    });
+  });
+
+  // ─── Subscription check ──────────────────────────────────────────────────────
+
+  bot.action("check_sub", async (ctx) => {
+    await ctx.answerCbQuery("Tekshirilmoqda…");
+    const { ok, missing } = await checkSubs(bot, ctx.from!.id).catch(() => ({ ok: false, missing: [] }));
+    if (ok) {
+      await ctx.editMessageText("✅ *Obuna tasdiqlandi\\! Botdan foydalanishingiz mumkin\\.* So'z yuboring\\!", {
+        parse_mode: "MarkdownV2",
+      });
+      const admin = await isAdmin(ctx.from!.id).catch(() => false);
+      return ctx.reply("Matn yuboring:", admin ? adminKb() : mainKb());
+    }
+    return ctx.editMessageText("❌ Hali ba'zi kanallarga obuna bo'lmadingiz:", { ...subKb(missing) });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ADMIN PANEL
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  bot.command("admin", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return ctx.reply("❌ Siz admin emassiz\\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply("🛠 *Admin paneli*", { parse_mode: "MarkdownV2", ...adminKb() });
+  });
+
+  bot.hears("📊 Statistika", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const [[total], [active], [blocked], [saved], [hist], channels] = await Promise.all([
+      db.select({ c: count() }).from(botUsers),
+      db.select({ c: count() }).from(botUsers).where(sql`last_active_at > now() - interval '24 hours'`),
+      db.select({ c: count() }).from(botUsers).where(eq(botUsers.isBlocked, true)),
+      db.select({ c: count() }).from(botSavedWords),
+      db.select({ c: count() }).from(botTranslationHistory),
+      getChannels(),
+    ]);
+    return ctx.reply(
+      `📊 *Bot Statistikasi*\n\n` +
+      `👥 Jami foydalanuvchilar: *${e(String(total?.c ?? 0))}*\n` +
+      `🟢 Bugun faol: *${e(String(active?.c ?? 0))}*\n` +
+      `🚫 Bloklangan: *${e(String(blocked?.c ?? 0))}*\n` +
+      `📚 Saqlangan so'zlar: *${e(String(saved?.c ?? 0))}*\n` +
+      `🕐 Jami tarjimalar: *${e(String(hist?.c ?? 0))}*\n` +
+      `📡 Majburiy kanallar: *${e(String(channels.length))}*`,
+      { parse_mode: "MarkdownV2" }
+    );
+  });
+
+  bot.command("stats", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const [[total], [active], [blocked], [saved], [hist], channels] = await Promise.all([
+      db.select({ c: count() }).from(botUsers),
+      db.select({ c: count() }).from(botUsers).where(sql`last_active_at > now() - interval '24 hours'`),
+      db.select({ c: count() }).from(botUsers).where(eq(botUsers.isBlocked, true)),
+      db.select({ c: count() }).from(botSavedWords),
+      db.select({ c: count() }).from(botTranslationHistory),
+      getChannels(),
+    ]);
+    return ctx.reply(
+      `📊 *Bot Statistikasi*\n\n` +
+      `👥 Jami foydalanuvchilar: *${e(String(total?.c ?? 0))}*\n` +
+      `🟢 Bugun faol: *${e(String(active?.c ?? 0))}*\n` +
+      `🚫 Bloklangan: *${e(String(blocked?.c ?? 0))}*\n` +
+      `📚 Saqlangan so'zlar: *${e(String(saved?.c ?? 0))}*\n` +
+      `🕐 Jami tarjimalar: *${e(String(hist?.c ?? 0))}*\n` +
+      `📡 Majburiy kanallar: *${e(String(channels.length))}*`,
+      { parse_mode: "MarkdownV2" }
+    );
+  });
+
+  bot.hears("📡 Kanallar", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const channels = await getChannels();
+    const btns = Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Qo'shish", "admin_add_channel"),
+       Markup.button.callback("❌ O'chirish", "admin_remove_channel")],
+    ]);
+    if (!channels.length) return ctx.reply("📡 *Majburiy kanallar yo'q\\.* Qo'shing:", { parse_mode: "MarkdownV2", ...btns });
+    const list = channels.map((ch, idx) => `${idx + 1}\\. [${e(ch.channelName)}](${ch.channelLink}) — \`${e(ch.channelId)}\``).join("\n");
+    return ctx.reply(`📡 *Majburiy kanallar:*\n\n${list}`, { parse_mode: "MarkdownV2", ...btns });
+  });
+
+  bot.hears("📢 Broadcast", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    setAS(ctx.from!.id, { type: "broadcast" });
+    return ctx.reply(
+      "📢 *Barcha foydalanuvchilarga xabar yuboring:*\n\n_Bekor qilish: /cancel_",
+      { parse_mode: "MarkdownV2", ...cancelKb() }
+    );
+  });
+
+  bot.command("broadcast", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    setAS(ctx.from!.id, { type: "broadcast" });
+    return ctx.reply(
+      "📢 *Barcha foydalanuvchilarga xabar yuboring:*\n\n_Bekor qilish: /cancel_",
+      { parse_mode: "MarkdownV2", ...cancelKb() }
+    );
+  });
+
+  bot.hears("👥 Foydalanuvchilar", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const users = await db.select().from(botUsers).orderBy(desc(botUsers.lastActiveAt)).limit(10);
+    if (!users.length) return ctx.reply("👥 *Foydalanuvchilar topilmadi\\.*", { parse_mode: "MarkdownV2" });
+    const list = users.map((u, idx) => {
+      const name = u.firstName ?? u.username ?? `ID: ${u.telegramId}`;
+      const status = u.isBlocked ? "🚫" : "✅";
+      return `${idx + 1}\\. ${status} ${e(name)} \\(@${e(u.username ?? "\\-")}\\) — \`${u.telegramId}\``;
+    }).join("\n");
+    return ctx.reply(
+      `👥 *So'nggi 10 foydalanuvchi:*\n\n${list}\n\n` +
+      `Bloklash: /block \\<id\\>\nBlokdan chiqarish: /unblock \\<id\\>`,
+      { parse_mode: "MarkdownV2" }
+    );
+  });
+
+  bot.hears("🔙 Orqaga", (ctx) => { setAS(ctx.from!.id, { type: "idle" }); return ctx.reply("🏠 Asosiy menyu:", mainKb()); });
+  bot.hears("❌ Bekor qilish", async (ctx) => {
+    setAS(ctx.from!.id, { type: "idle" });
+    const admin = await isAdmin(ctx.from!.id).catch(() => false);
+    return ctx.reply("❌ *Bekor qilindi\\.* Asosiy menyuga qaytdingiz\\.", { parse_mode: "MarkdownV2", ...(admin ? adminKb() : mainKb()) });
+  });
+
+  // Admin commands
+  bot.command("addadmin", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return ctx.reply("❌ Ruxsat yo'q\\.", { parse_mode: "MarkdownV2" });
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /addadmin \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.insert(botAdmins).values({ telegramId: id }).onConflictDoNothing();
+    return ctx.reply(`✅ Admin qo'shildi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  bot.command("removeadmin", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return ctx.reply("❌ Ruxsat yo'q\\.", { parse_mode: "MarkdownV2" });
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /removeadmin \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.delete(botAdmins).where(eq(botAdmins.telegramId, id));
+    return ctx.reply(`✅ Admin o'chirildi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  bot.command("block", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /block \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.update(botUsers).set({ isBlocked: true }).where(eq(botUsers.telegramId, id));
+    return ctx.reply(`🚫 Bloklandi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  bot.command("unblock", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /unblock \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.update(botUsers).set({ isBlocked: false }).where(eq(botUsers.telegramId, id));
+    return ctx.reply(`✅ Blokdan chiqarildi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  bot.command("blockuser", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /blockuser \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.update(botUsers).set({ isBlocked: true }).where(eq(botUsers.telegramId, id));
+    return ctx.reply(`🚫 Bloklandi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  bot.command("unblockuser", async (ctx) => {
+    if (!await isAdmin(ctx.from!.id)) return;
+    const id = Number(ctx.message.text.split(" ")[1]);
+    if (!id) return ctx.reply("Ishlatish: /unblockuser \\<telegram\\_id\\>", { parse_mode: "MarkdownV2" });
+    await db.update(botUsers).set({ isBlocked: false }).where(eq(botUsers.telegramId, id));
+    return ctx.reply(`✅ Blokdan chiqarildi: \`${id}\``, { parse_mode: "MarkdownV2" });
+  });
+
+  // Admin inline actions
+  bot.action("admin_add_channel", async (ctx) => {
+    await ctx.answerCbQuery();
+    setAS(ctx.from!.id, { type: "ch_id" });
+    return ctx.reply(
+      `📡 *1\\-qadam:* Kanal ID yoki username yuboring\nMasalan: \`@kanalim\` yoki \`\\-1001234567890\``,
+      { parse_mode: "MarkdownV2" }
+    );
+  });
+
+  bot.action("admin_remove_channel", async (ctx) => {
+    await ctx.answerCbQuery();
+    const channels = await getChannels();
+    if (!channels.length) return ctx.reply("📡 Kanallar yo'q.");
+    return ctx.reply("O'chiriladigan kanalni tanlang:",
+      Markup.inlineKeyboard(channels.map(ch => [Markup.button.callback(`❌ ${ch.channelName}`, `del_ch_${ch.id}`)])));
+  });
+
+  bot.action(/^del_ch_(\d+)$/, async (ctx) => {
+    await db.delete(botChannels).where(eq(botChannels.id, Number(ctx.match[1]!)));
+    await ctx.answerCbQuery("✅ O'chirildi");
+    return ctx.editMessageText("✅ Kanal o'chirildi\\.", { parse_mode: "MarkdownV2" });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MAIN TEXT HANDLER — Translation
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  bot.on(message("text"), async (ctx) => {
+    const text = ctx.message.text.trim();
+    const uid = ctx.from!.id;
+
+    // Skip slash commands (handled above)
+    if (text.startsWith("/")) return;
+
+    const state = getAS(uid);
+
+    // ── Admin broadcast flow ───────────────────────────────────────────────
+
+    if (state.type === "broadcast") {
+      setAS(uid, { type: "idle" });
+      const users = await db.select({ telegramId: botUsers.telegramId })
+        .from(botUsers).where(eq(botUsers.isBlocked, false));
+      let sent = 0, failed = 0;
+      const loading = await ctx.reply("📢 Yuborilmoqda…");
+      for (const u of users) {
+        try {
+          await bot.telegram.sendMessage(u.telegramId, text);
+          sent++;
+        } catch { failed++; }
+        if ((sent + failed) % 20 === 0) await new Promise(r => setTimeout(r, 1000));
+      }
+      await bot.telegram.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
+      return ctx.reply(
+        `📢 *Broadcast yakunlandi\\!*\n✅ ${e(String(sent))} ta yuborildi\n❌ ${e(String(failed))} ta yuborilmadi`,
+        { parse_mode: "MarkdownV2", ...adminKb() }
+      );
+    }
+
+    // ── Channel add flow ───────────────────────────────────────────────────
+
+    if (state.type === "ch_id") {
+      setAS(uid, { type: "ch_name", channelId: text });
+      return ctx.reply(`✅ ID: \`${e(text)}\`\n\n*2\\-qadam:* Kanal nomini yuboring:`, { parse_mode: "MarkdownV2" });
+    }
+    if (state.type === "ch_name") {
+      setAS(uid, { type: "ch_link", channelId: state.channelId, channelName: text });
+      return ctx.reply(`✅ Nom: *${e(text)}*\n\n*3\\-qadam:* Kanal linkini yuboring \\(https://t\\.me/\\.\\.\\.\\):`, { parse_mode: "MarkdownV2" });
+    }
+    if (state.type === "ch_link") {
+      await db.insert(botChannels)
+        .values({ channelId: state.channelId, channelName: state.channelName, channelLink: text })
+        .onConflictDoNothing();
+      setAS(uid, { type: "idle" });
+      return ctx.reply(
+        `✅ *Kanal qo'shildi\\!*\n📡 ${e(state.channelName)}\n🔗 ${e(text)}`,
+        { parse_mode: "MarkdownV2", ...adminKb() }
+      );
+    }
+
+    // ── Input validation ───────────────────────────────────────────────────
+
+    if (!text) return;
+
+    if (text.length > MAX_INPUT) {
+      return ctx.reply(
+        `⚠️ Matn juda uzun \\(${e(String(text.length))} ta belgi\\)\\.\n` +
+        `Maksimal: *${e(String(MAX_INPUT))}* ta belgi\\.`,
+        { parse_mode: "MarkdownV2", reply_parameters: { message_id: ctx.message.message_id } }
+      );
+    }
+
+    // ── Rate limit ─────────────────────────────────────────────────────────
+
+    if (isRateLimited(uid)) {
+      return ctx.reply(
+        "⏳ Biroz kuting… Ketma\\-ket yuborishni sekinlashtiring\\.",
+        { parse_mode: "MarkdownV2", reply_parameters: { message_id: ctx.message.message_id } }
+      );
+    }
+
+    // ── Translation ────────────────────────────────────────────────────────
+
+    const targetLang = await getUserTargetLang(uid).catch(() => "en");
+    await ctx.sendChatAction("typing");
+
+    try {
+      const result = await translateFull(text, targetLang);
+      const detectedLang = result.detectedLang;
+
+      // Store for save button & save to history (non-blocking)
+      pendingSave.set(uid, {
+        original: text, translated: result.translated,
+        sourceLang: detectedLang, targetLang,
+        level: result.level, definition: result.definition, synonyms: result.synonyms,
+      });
+      addHistory(uid, result, text, detectedLang, targetLang).catch(err =>
+        logger.warn({ err }, "addHistory failed")
+      );
+
+      const formatted = formatResult(result, targetLang, text);
+      return ctx.reply(formatted, {
+        parse_mode: "MarkdownV2",
+        reply_parameters: { message_id: ctx.message.message_id },
+        ...saveKb(false),
+      });
+    } catch (err) {
+      logger.error({ err }, "Translation failed");
+      return ctx.reply(
+        "❌ Tarjima qilishda xatolik yuz berdi\\. Iltimos, keyinroq urinib ko'ring\\.",
+        { parse_mode: "MarkdownV2", reply_parameters: { message_id: ctx.message.message_id } }
+      );
+    }
+  });
+
+  // ── Global error handler ──────────────────────────────────────────────────
+
+  bot.catch((err, ctx) => {
+    logger.error({ err, update: ctx.update }, "Unhandled bot error");
+    const uid = ctx.from?.id;
+    if (uid) {
+      ctx.reply("⚠️ Xatolik yuz berdi\\. Iltimos qayta urinib ko'ring\\.", { parse_mode: "MarkdownV2" }).catch(() => {});
+    }
+  });
+
+  return bot;
+}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 2: artifacts/api-server/src/index.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import app from "./app";
+import { logger } from "./lib/logger";
+import { createBot } from "./bot";
+
+const rawPort = process.env["PORT"];
+
+if (!rawPort) {
+  throw new Error(
+    "PORT environment variable is required but was not provided.",
+  );
+}
+
+const port = Number(rawPort);
+
+if (Number.isNaN(port) || port <= 0) {
+  throw new Error(`Invalid PORT value: "${rawPort}"`);
+}
+
+app.listen(port, (err) => {
+  if (err) {
+    logger.error({ err }, "Error listening on port");
+    process.exit(1);
+  }
+
+  logger.info({ port }, "Server listening");
+});
+
+// Start Telegram bot (long polling)
+if (process.env["TELEGRAM_BOT_TOKEN"]) {
+  const bot = createBot();
+  bot.launch({ dropPendingUpdates: true }).then(() => {
+    logger.info("Tarjimonation bot started (long polling)");
+  }).catch((err) => {
+    logger.error({ err }, "Failed to start Telegram bot");
+  });
+
+  // Graceful stop
+  process.once("SIGINT", () => bot.stop("SIGINT"));
+  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+} else {
+  logger.warn("TELEGRAM_BOT_TOKEN not set — bot not started");
+}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 3: artifacts/api-server/src/app.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import express, { type Express } from "express";
+import cors from "cors";
+import pinoHttp from "pino-http";
+import router from "./routes";
+import { logger } from "./lib/logger";
+
+const app: Express = express();
+
+app.use(
+  pinoHttp({
+    logger,
+    serializers: {
+      req(req) {
+        return {
+          id: req.id,
+          method: req.method,
+          url: req.url?.split("?")[0],
+        };
+      },
+      res(res) {
+        return {
+          statusCode: res.statusCode,
+        };
+      },
+    },
+  }),
+);
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use("/api", router);
+
+export default app;
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 4: artifacts/api-server/src/lib/logger.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import pino from "pino";
+
+const isProduction = process.env.NODE_ENV === "production";
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? "info",
+  redact: [
+    "req.headers.authorization",
+    "req.headers.cookie",
+    "res.headers['set-cookie']",
+  ],
+  ...(isProduction
+    ? {}
+    : {
+        transport: {
+          target: "pino-pretty",
+          options: { colorize: true },
+        },
+      }),
+});
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 5: artifacts/api-server/src/routes/index.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import { Router, type IRouter } from "express";
+import healthRouter from "./health";
+
+const router: IRouter = Router();
+
+router.use(healthRouter);
+
+export default router;
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 6: artifacts/api-server/src/routes/health.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import { Router, type IRouter } from "express";
+import { HealthCheckResponse } from "@workspace/api-zod";
+
+const router: IRouter = Router();
+
+router.get("/healthz", (_req, res) => {
+  const data = HealthCheckResponse.parse({ status: "ok" });
+  res.json(data);
+});
+
+export default router;
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 7: lib/db/src/schema/bot.ts   ← DATABASE JADVALLARI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import { pgTable, bigint, text, boolean, timestamp, serial, jsonb, integer } from "drizzle-orm/pg-core";
+
+export const botUsers = pgTable("bot_users", {
+  id: serial("id").primaryKey(),
+  telegramId: bigint("telegram_id", { mode: "number" }).notNull().unique(),
+  username: text("username"),
+  firstName: text("first_name"),
+  lastName: text("last_name"),
+  sourceLang: text("source_lang").notNull().default("uz"),
+  targetLang: text("target_lang").notNull().default("en"),
+  isBlocked: boolean("is_blocked").notNull().default(false),
+  totalTranslations: integer("total_translations").notNull().default(0),
+  streakDays: integer("streak_days").notNull().default(0),
+  lastStreakDate: text("last_streak_date"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  lastActiveAt: timestamp("last_active_at").notNull().defaultNow(),
+});
+export type BotUser = typeof botUsers.$inferSelect;
+
+export const botAdmins = pgTable("bot_admins", {
+  id: serial("id").primaryKey(),
+  telegramId: bigint("telegram_id", { mode: "number" }).notNull().unique(),
+  username: text("username"),
+  addedAt: timestamp("added_at").notNull().defaultNow(),
+});
+export type BotAdmin = typeof botAdmins.$inferSelect;
+
+export const botChannels = pgTable("bot_channels", {
+  id: serial("id").primaryKey(),
+  channelId: text("channel_id").notNull().unique(),
+  channelName: text("channel_name").notNull(),
+  channelLink: text("channel_link").notNull(),
+  addedAt: timestamp("added_at").notNull().defaultNow(),
+});
+export type BotChannel = typeof botChannels.$inferSelect;
+
+export const botSavedWords = pgTable("bot_saved_words", {
+  id: serial("id").primaryKey(),
+  telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+  original: text("original").notNull(),
+  translated: text("translated").notNull(),
+  sourceLang: text("source_lang").notNull(),
+  targetLang: text("target_lang").notNull(),
+  level: text("level"),
+  definition: text("definition"),
+  synonyms: jsonb("synonyms").$type<string[]>().default([]),
+  savedAt: timestamp("saved_at").notNull().defaultNow(),
+});
+export type BotSavedWord = typeof botSavedWords.$inferSelect;
+
+export const botTranslationHistory = pgTable("bot_translation_history", {
+  id: serial("id").primaryKey(),
+  telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+  original: text("original").notNull(),
+  translated: text("translated").notNull(),
+  sourceLang: text("source_lang").notNull(),
+  targetLang: text("target_lang").notNull(),
+  level: text("level"),
+  translatedAt: timestamp("translated_at").notNull().defaultNow(),
+});
+export type BotTranslationHistory = typeof botTranslationHistory.$inferSelect;
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAYL 8: lib/db/src/schema/index.ts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+export * from "./bot";
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         MUHIT O'ZGARUVCHILARI                              ║
+║                    (.env yoki Replit Secrets ichida)                       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  TELEGRAM_BOT_TOKEN   — @BotFather dan olingan token                       ║
+║  OPENAI_API_KEY       — OpenAI kaliti (gsk_ bilan boshlansa → Groq)        ║
+║  SESSION_SECRET       — Express session uchun maxfiy kalit                  ║
+║  BOT_ADMIN_IDS        — Admin Telegram ID lari (vergul bilan: 123,456)     ║
+║  DATABASE_URL         — PostgreSQL ulanish manzili (avtomatik Replit'da)   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         ISHLASH TARTIBI                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  1. pnpm install                  — paketlarni o'rnatish                   ║
+║  2. pnpm db:migrate               — DB jadvallarini yaratish               ║
+║  3. pnpm --filter @workspace/api-server run dev   — ishga tushurish        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
